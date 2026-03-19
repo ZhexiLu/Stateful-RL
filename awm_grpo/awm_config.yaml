@@ -1,0 +1,12 @@
+# Custom config for AWM multi-turn rollout
+max_turns: 15
+server_startup_timeout: 15.0
+tool_timeout: 30.0
+
+# AWM data paths (relative to agent-world-model/)
+awm_root: ../agent-world-model
+awm_db_schema_path: ../agent-world-model/outputs/gen_db.jsonl
+awm_sample_path: ../agent-world-model/outputs/gen_sample.jsonl
+awm_verifier_path: ../agent-world-model/outputs/gen_verifier.pure_code.jsonl
+awm_envs_path: ../agent-world-model/outputs/gen_envs.jsonl
+awm_db_dir: ../agent-world-model/outputs/databases

@@ -1,0 +1,61 @@
+# Original git repos (backed up)
+.git_bak/
+
+# Virtual environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# AWM generated outputs (large data files - download separately)
+agent-world-model/outputs/databases/
+agent-world-model/outputs/gen_*.jsonl
+agent-world-model/outputs/seed_scenario.jsonl
+agent-world-model/outputs/temp_server_*.py
+agent-world-model/outputs/server_logs/
+agent-world-model/outputs/README.md
+agent-world-model/eval_results/
+agent-world-model/eval_results_v2/
+agent-world-model/watchdog.log
+agent-world-model/uv.lock
+
+# slime internal git (we're in a new repo)
+slime/.git/
+
+# Model weights and large datasets
+slime/examples/retool/foot-info/
+slime/examples/retool/dapo-math-17k/
+slime/examples/retool/datasets/
+slime/examples/retool/Qwen/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+
+# awm_grpo generated data
+awm_grpo/data/
+awm_grpo/__pycache__/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Other FailureCall directories not needed
+AgentFlow/
+OpenClaw-RL/
+toolmind/
+train/
+datasets/
+data/
+verl/
+
+# slime build artifacts
+slime/docker/
+slime/uv.lock
+*.log
