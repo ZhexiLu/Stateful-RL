@@ -10,6 +10,7 @@ Verifies that:
 import os
 import sys
 import time
+import asyncio
 
 AWM_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent-world-model")
 AWMGRPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -53,7 +54,7 @@ def find_scenario_with_multiple_tasks():
     raise RuntimeError("No scenario with 2+ verified tasks found")
 
 
-def run_task(scenario, task, task_idx, label=""):
+async def run_task(scenario, task, task_idx, label=""):
     """Run a single task and return timing + result."""
     env = AWMEnv(
         scenario=scenario,
@@ -63,28 +64,28 @@ def run_task(scenario, task, task_idx, label=""):
     )
 
     t0 = time.time()
-    env.reset()
+    await env.reset()
     reset_time = time.time() - t0
 
     # list_tools
-    obs, done, info = env.step(
+    obs, done, info = await env.step(
         '<tool_call>\n{"name": "list_tools", "arguments": null}\n</tool_call>'
     )
     assert not done
     tools_len = len(obs["obs_str"])
 
     # final answer
-    obs, done, info = env.step("Task complete.")
+    obs, done, info = await env.step("Task complete.")
     assert done
 
     reward = env.compute_reward()
-    env.close()
+    await env.close()
 
     print(f"  {label}: reset={reset_time:.2f}s, tools={tools_len} chars, reward={reward}")
     return reset_time, reward
 
 
-def main():
+async def main():
     preload_awm_data(
         db_schema_path=os.path.join(AWM_ROOT, "outputs/gen_db.jsonl"),
         sample_path=os.path.join(AWM_ROOT, "outputs/gen_sample.jsonl"),
@@ -102,19 +103,19 @@ def main():
     print(f"\n{'='*60}")
     print("TEST 1: Cold start (first task)")
     print(f"{'='*60}")
-    t1_reset, t1_reward = run_task(scenario, tasks[0][1], tasks[0][0], "Task 0 (cold)")
+    t1_reset, t1_reward = await run_task(scenario, tasks[0][1], tasks[0][0], "Task 0 (cold)")
 
     # === Test 2: Second task on SAME scenario (warm — server reuse) ===
     print(f"\n{'='*60}")
     print("TEST 2: Warm reuse (second task, same scenario)")
     print(f"{'='*60}")
-    t2_reset, t2_reward = run_task(scenario, tasks[1][1], tasks[1][0], "Task 1 (warm)")
+    t2_reset, t2_reward = await run_task(scenario, tasks[1][1], tasks[1][0], "Task 1 (warm)")
 
     # === Test 3: Third task on SAME scenario (still warm) ===
     print(f"\n{'='*60}")
     print("TEST 3: Still warm (third task = repeat of task 0)")
     print(f"{'='*60}")
-    t3_reset, t3_reward = run_task(scenario, tasks[0][1], tasks[0][0], "Task 0 again (warm)")
+    t3_reset, t3_reward = await run_task(scenario, tasks[0][1], tasks[0][0], "Task 0 again (warm)")
 
     # === Summary ===
     print(f"\n{'='*60}")
@@ -136,4 +137,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

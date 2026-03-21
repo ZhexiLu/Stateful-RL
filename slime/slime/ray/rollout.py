@@ -923,6 +923,12 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
         router_args.log_level = "warn"
         router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
+        if router_args.policy == "power_of_two" and len(router_args.worker_urls) < 2:
+            logger.warning(
+                "Router policy 'power_of_two' requires at least 2 workers at startup; "
+                "falling back to 'round_robin' until workers register."
+            )
+            router_args.policy = "round_robin"
 
         if has_pd_disaggregation:
             router_args.pd_disaggregation = True

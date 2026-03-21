@@ -409,8 +409,17 @@ async def generate_rollout_async(
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
+                prompt_text = str(sample.prompt)
+                response_text = str(sample.response)
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    "First rollout sample: "
+                    f"prompt_chars={len(prompt_text)}, "
+                    f"response_chars={len(response_text)}, "
+                    f"response_tokens={sample.response_length}, "
+                    f"label_preview={str(sample.label)[:100]!r}, "
+                    f"reward={sample.reward}, "
+                    f"prompt_preview={prompt_text[:200]!r}, "
+                    f"response_preview={response_text[:200]!r}",
                 )
                 do_print = False
 

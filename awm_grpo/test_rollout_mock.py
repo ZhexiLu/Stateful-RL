@@ -17,6 +17,7 @@ import sys
 import json
 import re
 import time
+import asyncio
 
 AWM_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent-world-model")
 AWMGRPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -57,7 +58,7 @@ def find_test_scenario():
     raise RuntimeError("No valid test scenario found")
 
 
-def simulate_rollout(scenario: str, task: str, task_idx: int):
+async def simulate_rollout(scenario: str, task: str, task_idx: int):
     """
     Simulate a full multi-turn rollout with scripted agent responses.
 
@@ -120,7 +121,7 @@ def simulate_rollout(scenario: str, task: str, task_idx: int):
     )
 
     t0 = time.time()
-    env.reset()
+    await env.reset()
     print(f"Env reset: {time.time()-t0:.1f}s")
 
     # === Turn 1: list_tools ===
@@ -142,7 +143,7 @@ def simulate_rollout(scenario: str, task: str, task_idx: int):
     log_probs.extend([-0.5] * len(resp_ids))  # mock log probs
     print(f"  Model tokens: {len(resp_ids)} (loss_mask=1)")
 
-    obs, done, info = env.step(agent_response_1)
+    obs, done, info = await env.step(agent_response_1)
     assert not done
     tools_text = obs["obs_str"]
     print(f"  Env response: {len(tools_text)} chars")
@@ -200,7 +201,7 @@ def simulate_rollout(scenario: str, task: str, task_idx: int):
         log_probs.extend([-0.8] * len(resp_ids_2))
         print(f"  Model tokens: {len(resp_ids_2)} (loss_mask=1)")
 
-        obs2, done2, info2 = env.step(agent_response_2)
+        obs2, done2, info2 = await env.step(agent_response_2)
         tool_result = obs2["obs_str"]
         print(f"  Tool result: {tool_result[:200]}...")
 
@@ -232,7 +233,7 @@ def simulate_rollout(scenario: str, task: str, task_idx: int):
     log_probs.extend([-1.0] * len(resp_ids_3))
     print(f"  Model tokens: {len(resp_ids_3)} (loss_mask=1)")
 
-    obs3, done3, info3 = env.step(agent_response_3)
+    obs3, done3, info3 = await env.step(agent_response_3)
     assert done3, f"Should be done after no tool call, got done={done3}"
     print(f"  Done: {done3}, reason: {info3.get('done_reason')}")
 
@@ -269,7 +270,7 @@ def simulate_rollout(scenario: str, task: str, task_idx: int):
     print(f"  ALL ASSERTIONS PASSED")
 
     # Cleanup
-    env.close()
+    await env.close()
     print(f"  Env closed")
 
     return {
@@ -296,7 +297,7 @@ def test_concurrent_envs(scenarios_data):
 
     def run_env(idx, scenario, task, task_idx):
         try:
-            results[idx] = simulate_rollout(scenario, task, task_idx)
+            results[idx] = asyncio.run(simulate_rollout(scenario, task, task_idx))
         except Exception as e:
             errors[idx] = str(e)
             import traceback
@@ -373,7 +374,7 @@ if __name__ == "__main__":
 
     # Single rollout test
     scenarios = find_multiple_scenarios(2)
-    result = simulate_rollout(*scenarios[0])
+    result = asyncio.run(simulate_rollout(*scenarios[0]))
     print(f"\nSingle rollout result: {json.dumps(result, indent=2)}")
 
     # Concurrent test

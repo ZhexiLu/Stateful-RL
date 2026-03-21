@@ -1,9 +1,14 @@
+import logging
+import time
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+
+logger = logging.getLogger(__name__)
 
 
 def train(args):
@@ -64,13 +69,35 @@ def train(args):
         if args.rollout_global_dataset:
             ray.get(rollout_manager.save.remote(rollout_id))
 
+    def get_rollout_data_ref(rollout_id):
+        rollout_data_future = rollout_manager.generate.remote(rollout_id)
+        max_retries = 3
+        retry_delay_s = 10
+
+        for attempt in range(max_retries + 1):
+            try:
+                return ray.get(rollout_data_future)
+            except ray.exceptions.ActorUnavailableError as exc:
+                if attempt >= max_retries:
+                    raise
+                logger.warning(
+                    "RolloutManager.generate(%s) temporarily unavailable (%s/%s): %s. "
+                    "Retrying ray.get on the same ObjectRef in %ss.",
+                    rollout_id,
+                    attempt + 1,
+                    max_retries,
+                    exc,
+                    retry_delay_s,
+                )
+                time.sleep(retry_delay_s)
+
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
             ray.get(rollout_manager.eval.remote(rollout_id))
 
-        rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        rollout_data_ref = get_rollout_data_ref(rollout_id)
 
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())

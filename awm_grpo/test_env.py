@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import time
+import asyncio
 
 # Setup paths
 AWM_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent-world-model")
@@ -73,7 +74,7 @@ def test_preload():
     print("  PASSED\n")
 
 
-def test_env_lifecycle(scenario, task, task_idx):
+async def test_env_lifecycle(scenario, task, task_idx):
     """Test: full env lifecycle."""
     print("=" * 60)
     print(f"TEST 2: Env lifecycle for {scenario}[{task_idx}]")
@@ -95,17 +96,17 @@ def test_env_lifecycle(scenario, task, task_idx):
     print("  Resetting env (DB + MCP server)...")
     t0 = time.time()
     try:
-        env.reset()
+        await env.reset()
     except Exception as e:
         print(f"  FAILED: env.reset() raised {e}")
-        env.close()
+        await env.close()
         return False
     print(f"  Reset done in {time.time() - t0:.1f}s")
 
     # Step 1: list_tools
     print("  Step 1: list_tools...")
     response_text = '<tool_call>\n{"name": "list_tools", "arguments": null}\n</tool_call>'
-    obs, done, info = env.step(response_text)
+    obs, done, info = await env.step(response_text)
     tools_text = obs.get("obs_str", "")
     print(f"  Tools response length: {len(tools_text)} chars")
     print(f"  Done: {done}, Info: {info.get('tool_name')}")
@@ -121,7 +122,7 @@ def test_env_lifecycle(scenario, task, task_idx):
         test_tool = tool_names[0]
         print(f"\n  Step 2: calling {test_tool}...")
         response_text = f'<tool_call>\n{{"name": "call_tool", "arguments": {{"tool_name": "{test_tool}", "arguments": "{{}}"}}}}\n</tool_call>'
-        obs, done, info = env.step(response_text)
+        obs, done, info = await env.step(response_text)
         tool_result = obs.get("obs_str", "")
         print(f"  Tool result: {tool_result[:200]}...")
         print(f"  Done: {done}")
@@ -131,7 +132,7 @@ def test_env_lifecycle(scenario, task, task_idx):
     # Step 3: no tool call (final answer)
     print(f"\n  Step 3: final answer (no tool call)...")
     response_text = "Based on my analysis, the task is complete."
-    obs, done, info = env.step(response_text)
+    obs, done, info = await env.step(response_text)
     print(f"  Done: {done}, Reason: {info.get('done_reason')}")
     assert done, "Should be done after no tool call"
     print("  Final answer PASSED")
@@ -144,7 +145,7 @@ def test_env_lifecycle(scenario, task, task_idx):
 
     # Close
     print(f"\n  Closing env...")
-    env.close()
+    await env.close()
     print("  Close PASSED")
 
     print(f"\n  FULL LIFECYCLE PASSED (reward={reward})")
@@ -180,7 +181,7 @@ if __name__ == "__main__":
 
     test_preload()
     test_port_pool()
-    test_env_lifecycle(scenario, task, task_idx)
+    asyncio.run(test_env_lifecycle(scenario, task, task_idx))
 
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED")

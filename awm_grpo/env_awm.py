@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import re
 from dataclasses import dataclass, field
@@ -113,10 +114,23 @@ class AWMDataCache:
     verifiers: dict[str, dict] = field(default_factory=dict)
     envs_path: str = ""
     db_dir: str = ""
+    template_db_dir: str = ""
+    template_snapshots: dict[str, str] = field(default_factory=dict)
     loaded: bool = False
 
 
 _DATA_CACHE = AWMDataCache()
+_TEMPLATE_DB_LOCK = threading.Lock()
+
+
+_THREAD_LIMIT_ENV = {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "RAYON_NUM_THREADS": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+}
 
 
 def preload_awm_data(
@@ -143,7 +157,54 @@ def preload_awm_data(
 
     _DATA_CACHE.envs_path = envs_path
     _DATA_CACHE.db_dir = db_dir
+    _DATA_CACHE.template_db_dir = os.path.join(db_dir, "_templates")
+    if os.path.isdir(_DATA_CACHE.template_db_dir):
+        for filename in os.listdir(_DATA_CACHE.template_db_dir):
+            if not filename.endswith("_template.db"):
+                continue
+            scenario = filename[: -len("_template.db")]
+            _DATA_CACHE.template_snapshots[scenario] = os.path.join(_DATA_CACHE.template_db_dir, filename)
     _DATA_CACHE.loaded = True
+
+
+def _ensure_template_db(scenario: str) -> str:
+    template_path = _DATA_CACHE.template_snapshots.get(scenario)
+    if template_path and os.path.exists(template_path):
+        return template_path
+
+    with _TEMPLATE_DB_LOCK:
+        template_path = _DATA_CACHE.template_snapshots.get(scenario)
+        if template_path and os.path.exists(template_path):
+            return template_path
+
+        schema_item = _DATA_CACHE.db_schemas.get(scenario)
+        if schema_item is None:
+            raise RuntimeError(f"Schema not found for {scenario}")
+
+        os.makedirs(_DATA_CACHE.template_db_dir, exist_ok=True)
+        template_name = f"{scenario}__template"
+        template_filename = f"{normalize_scenario_name(template_name)}.db"
+        template_path = os.path.join(_DATA_CACHE.template_db_dir, template_filename)
+
+        if not os.path.exists(template_path):
+            template_path, _, _, _ = create_sqlite_database(
+                template_name, schema_item["db_schema"], _DATA_CACHE.template_db_dir
+            )
+            sample_item = _DATA_CACHE.sample_data.get(scenario)
+            if sample_item:
+                execute_sample_data(template_path, sample_item["sample_data"], template_name)
+
+        _DATA_CACHE.template_snapshots[scenario] = template_path
+        return template_path
+
+
+def _reset_db_file(scenario: str, db_path: str) -> str:
+    """Reset a scenario database file to its initial state."""
+    db_dir = os.path.dirname(db_path)
+    os.makedirs(db_dir, exist_ok=True)
+    template_path = _ensure_template_db(scenario)
+    shutil.copy2(template_path, db_path)
+    return db_path
 
 
 # ── Server pool: reuse MCP servers across tasks of the same scenario ─────────
@@ -153,6 +214,7 @@ class _ServerSlot:
     """A running MCP server for a specific scenario."""
     scenario: str
     port: int
+    db_path: str
     proc: subprocess.Popen
     mcp_url: str
     tools_text: str  # cached list_tools output (same per scenario)
@@ -164,7 +226,8 @@ class ServerPool:
     Thread-safe pool of MCP servers, keyed by scenario.
 
     When a task requests a scenario that already has a warm server,
-    we only reset the DB file (NullPool ensures fresh connections).
+    we reuse it only after the previous lease is released. This keeps
+    every rollout sample on an exclusive MCP server / SQLite file pair.
     When the scenario differs, we start a new server (or evict the LRU
     if we've hit capacity).
 
@@ -172,77 +235,168 @@ class ServerPool:
     produces correct results without restarting the server process.
     """
 
-    def __init__(self, max_servers: int = 32, startup_timeout: float = 15.0):
-        import threading
+    def __init__(
+        self,
+        max_servers: int = 8,
+        startup_timeout: float = 30.0,
+        acquire_poll_interval: float = 0.1,
+        startup_max_retries: int = 2,
+    ):
         self._lock = threading.Lock()
-        self._slots: dict[str, _ServerSlot] = {}  # scenario -> slot
+        self._slots: dict[str, list[_ServerSlot]] = {}  # scenario -> slots
         self._max_servers = max_servers
         self._startup_timeout = startup_timeout
-        # Track which slots are busy (leased to an env)
-        self._busy: set[str] = set()
+        self._acquire_poll_interval = acquire_poll_interval
+        self._startup_max_retries = startup_max_retries
+        # Track which concrete slots are busy (leased to envs)
+        self._busy: set[int] = set()
+        # Track in-flight server starts per scenario.
+        self._starting: dict[str, int] = {}
 
-    def acquire(self, scenario: str) -> _ServerSlot:
-        """Get a server for the given scenario. Reuse if available, start if not."""
+    async def acquire(self, scenario: str) -> _ServerSlot:
+        """Get an exclusive server slot for the given scenario."""
+        slots_to_stop: list[_ServerSlot] = []
+
+        while True:
+            should_start = False
+            slot_to_return: _ServerSlot | None = None
+            with self._lock:
+                slots_to_stop.extend(self._prune_dead_slots_locked(scenario))
+                slots = self._slots.get(scenario, [])
+
+                for slot in slots:
+                    if slot.port not in self._busy:
+                        slot.last_used = time.time()
+                        self._busy.add(slot.port)
+                        slot_to_return = slot
+                        break
+
+                if slot_to_return is None:
+                    if self._total_slots_locked() + self._total_starting_locked() >= self._max_servers:
+                        evicted = self._evict_one_locked()
+                        if evicted is not None:
+                            slots_to_stop.append(evicted)
+
+                    if self._total_slots_locked() + self._total_starting_locked() < self._max_servers:
+                        self._starting[scenario] = self._starting.get(scenario, 0) + 1
+                        should_start = True
+
+            for slot in slots_to_stop:
+                self._stop_slot(slot)
+            slots_to_stop = []
+
+            if slot_to_return is not None:
+                return slot_to_return
+
+            if should_start:
+                break
+
+            await asyncio.sleep(self._acquire_poll_interval)
+
+        try:
+            slot = await self._start_server(scenario, max_retries=self._startup_max_retries)
+        except Exception:
+            with self._lock:
+                self._decrement_starting_locked(scenario)
+            raise
+
         with self._lock:
-            slot = self._slots.get(scenario)
-            if slot and slot.proc.poll() is None:
-                # Server still alive — just reuse it
-                slot.last_used = time.time()
-                self._busy.add(scenario)
-                return slot
+            self._decrement_starting_locked(scenario)
+            slot.last_used = time.time()
+            self._slots.setdefault(scenario, []).append(slot)
+            self._busy.add(slot.port)
 
-            # Need a new server; evict LRU if at capacity
-            if len(self._slots) >= self._max_servers:
-                self._evict_one_locked()
-
-        # Start new server (outside lock — blocking I/O)
-        slot = self._start_server(scenario)
-        with self._lock:
-            self._slots[scenario] = slot
-            self._busy.add(scenario)
         return slot
 
-    def release(self, scenario: str):
+    def release(self, slot: _ServerSlot):
         """Mark a server slot as no longer busy."""
         with self._lock:
-            self._busy.discard(scenario)
+            self._busy.discard(slot.port)
+            slot.last_used = time.time()
 
     def shutdown_all(self):
         """Stop all servers. Call on process exit."""
         with self._lock:
-            for slot in self._slots.values():
-                self._stop_slot(slot)
+            for slots in self._slots.values():
+                for slot in slots:
+                    self._stop_slot(slot)
             self._slots.clear()
             self._busy.clear()
 
     def _evict_one_locked(self):
         """Evict the least-recently-used non-busy slot. Must hold _lock."""
         candidates = [
-            (s, slot) for s, slot in self._slots.items() if s not in self._busy
+            (scenario, slot)
+            for scenario, slots in self._slots.items()
+            for slot in slots
+            if slot.port not in self._busy
         ]
         if not candidates:
-            return  # all busy, just let it grow
+            return None
         candidates.sort(key=lambda x: x[1].last_used)
         evict_scenario, evict_slot = candidates[0]
-        self._stop_slot(evict_slot)
-        del self._slots[evict_scenario]
+        slots = [slot for slot in self._slots.get(evict_scenario, []) if slot.port != evict_slot.port]
+        if slots:
+            self._slots[evict_scenario] = slots
+        else:
+            self._slots.pop(evict_scenario, None)
+        return evict_slot
 
-    def _start_server(self, scenario: str) -> _ServerSlot:
-        """Start a new MCP server subprocess for the given scenario."""
+    def _prune_dead_slots_locked(self, scenario: str) -> list[_ServerSlot]:
+        dead_slots: list[_ServerSlot] = []
+        healthy_slots: list[_ServerSlot] = []
+        for slot in self._slots.get(scenario, []):
+            if slot.proc.poll() is None:
+                healthy_slots.append(slot)
+            else:
+                dead_slots.append(slot)
+                self._busy.discard(slot.port)
+
+        if healthy_slots:
+            self._slots[scenario] = healthy_slots
+        else:
+            self._slots.pop(scenario, None)
+        return dead_slots
+
+    def _total_slots_locked(self) -> int:
+        return sum(len(slots) for slots in self._slots.values())
+
+    def _total_starting_locked(self) -> int:
+        return sum(self._starting.values())
+
+    def _decrement_starting_locked(self, scenario: str) -> None:
+        count = self._starting.get(scenario, 0)
+        if count <= 1:
+            self._starting.pop(scenario, None)
+        else:
+            self._starting[scenario] = count - 1
+
+    async def _start_server(self, scenario: str, max_retries: int = 2) -> _ServerSlot:
+        """Start a new MCP server subprocess for the given scenario.
+
+        Retries on failure with a fresh port each time.
+        """
+        last_error: Exception | None = None
         pool = get_port_pool()
-        port = pool.acquire()
 
-        db_path = os.path.join(_DATA_CACHE.db_dir, f"{scenario}.db")
-        script_dir = AWM_ROOT
-        log_dir = os.path.join(script_dir, "outputs", "server_logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, f"{scenario}_{port}.log")
-        log_handle = open(log_path, "wb")
+        for attempt in range(1 + max_retries):
+            port = pool.acquire()
+            db_path = os.path.join(_DATA_CACHE.db_dir, f"{scenario}_slot_p{port}.db")
+            log_handle = None
+            proc = None
 
-        _kill_port(port)
-        cmd = [
-            sys.executable, "-c",
-            f"""
+            try:
+                await asyncio.to_thread(_reset_db_file, scenario, db_path)
+                script_dir = AWM_ROOT
+                log_dir = os.path.join(script_dir, "outputs", "server_logs")
+                os.makedirs(log_dir, exist_ok=True)
+                log_path = os.path.join(log_dir, f"{scenario}_{port}.log")
+                log_handle = open(log_path, "wb")
+
+                _kill_port(port)
+                cmd = [
+                    sys.executable, "-c",
+                    f"""
 import sys
 sys.path.insert(0, '{AWM_ROOT}')
 from awm.core.server import Config, run_server
@@ -256,41 +410,62 @@ config = Config(
 config.pre_process()
 run_server(config)
 """
-        ]
-        proc = subprocess.Popen(
-            cmd, cwd=script_dir, stdout=log_handle, stderr=log_handle,
-        )
-        proc._log_handle = log_handle
-        proc._log_path = log_path
+                ]
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=script_dir,
+                    stdout=log_handle,
+                    stderr=log_handle,
+                    env={**os.environ, **_THREAD_LIMIT_ENV},
+                )
+                proc._log_handle = log_handle
+                proc._log_path = log_path
 
-        mcp_url = f"http://127.0.0.1:{port}/mcp"
+                mcp_url = f"http://127.0.0.1:{port}/mcp"
 
-        # Wait for server readiness
-        loop = asyncio.new_event_loop()
-        try:
-            ready = loop.run_until_complete(
-                self._wait_for_server(mcp_url, self._startup_timeout)
-            )
-        finally:
-            loop.close()
+                # Wait for server readiness
+                ready = await self._wait_for_server(mcp_url, self._startup_timeout)
 
-        if not ready:
-            proc.kill()
-            proc.wait()
-            log_handle.close()
-            pool.release(port)
-            raise RuntimeError(f"MCP server for {scenario} failed to start on port {port}")
+                if not ready:
+                    raise RuntimeError(
+                        f"MCP server for {scenario} failed to start on port {port} "
+                        f"(attempt {attempt + 1}/{1 + max_retries})"
+                    )
 
-        # Fetch and cache tool listing (same for all tasks in a scenario)
-        loop = asyncio.new_event_loop()
-        try:
-            tools_text = loop.run_until_complete(self._fetch_tools(mcp_url))
-        finally:
-            loop.close()
+                # Fetch and cache tool listing (same for all tasks in a scenario)
+                tools_text = await self._fetch_tools(mcp_url)
 
-        return _ServerSlot(
-            scenario=scenario, port=port, proc=proc,
-            mcp_url=mcp_url, tools_text=tools_text, last_used=time.time(),
+                return _ServerSlot(
+                    scenario=scenario, port=port, db_path=db_path, proc=proc,
+                    mcp_url=mcp_url, tools_text=tools_text, last_used=time.time(),
+                )
+            except Exception as e:
+                last_error = e
+                # Clean up failed attempt
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=3)
+                    except Exception:
+                        pass
+                if log_handle is not None:
+                    try:
+                        log_handle.close()
+                    except Exception:
+                        pass
+                _kill_port(port)
+                pool.release(port)
+
+                if attempt < max_retries:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "MCP server start failed for %s (attempt %d/%d): %s — retrying",
+                        scenario, attempt + 1, 1 + max_retries, e,
+                    )
+                    await asyncio.sleep(0.5)
+
+        raise RuntimeError(
+            f"MCP server for {scenario} failed after {1 + max_retries} attempts: {last_error}"
         )
 
     def _stop_slot(self, slot: _ServerSlot):
@@ -309,6 +484,11 @@ run_server(config)
             try:
                 log_handle.close()
             except Exception:
+                pass
+        if slot.db_path and os.path.exists(slot.db_path):
+            try:
+                os.remove(slot.db_path)
+            except OSError:
                 pass
         _kill_port(slot.port)
         get_port_pool().release(slot.port)
@@ -340,10 +520,25 @@ run_server(config)
 _SERVER_POOL: ServerPool | None = None
 
 
-def get_server_pool(max_servers: int = 32, startup_timeout: float = 15.0) -> ServerPool:
+def get_server_pool(
+    max_servers: int = 8,
+    startup_timeout: float = 30.0,
+    acquire_poll_interval: float = 0.1,
+    startup_max_retries: int = 2,
+) -> ServerPool:
     global _SERVER_POOL
     if _SERVER_POOL is None:
-        _SERVER_POOL = ServerPool(max_servers, startup_timeout)
+        _SERVER_POOL = ServerPool(
+            max_servers=max_servers,
+            startup_timeout=startup_timeout,
+            acquire_poll_interval=acquire_poll_interval,
+            startup_max_retries=startup_max_retries,
+        )
+    else:
+        _SERVER_POOL._max_servers = max_servers
+        _SERVER_POOL._startup_timeout = startup_timeout
+        _SERVER_POOL._acquire_poll_interval = acquire_poll_interval
+        _SERVER_POOL._startup_max_retries = startup_max_retries
     return _SERVER_POOL
 
 
@@ -366,7 +561,10 @@ class AWMEnv:
         task: str,
         task_idx: int,
         max_iterations: int = 15,
-        server_startup_timeout: float = 15.0,
+        server_startup_timeout: float = 30.0,
+        server_startup_max_retries: int = 2,
+        server_pool_max_servers: int = 8,
+        server_pool_acquire_poll_interval: float = 0.1,
         tool_timeout: float = 30.0,
     ):
         self.scenario = normalize_scenario_name(scenario)
@@ -374,6 +572,9 @@ class AWMEnv:
         self.task_idx = task_idx
         self.max_iterations = max_iterations
         self.server_startup_timeout = server_startup_timeout
+        self.server_startup_max_retries = server_startup_max_retries
+        self.server_pool_max_servers = server_pool_max_servers
+        self.server_pool_acquire_poll_interval = server_pool_acquire_poll_interval
         self.tool_timeout = tool_timeout
 
         # Runtime state
@@ -381,7 +582,6 @@ class AWMEnv:
         self._mcp: MCPToolExecutor | None = None
         self._tools_text: str = ""
         self._tools_listed: bool = False
-        self._loop: asyncio.AbstractEventLoop | None = None
         self._iteration: int = 0
 
         # DB paths
@@ -394,12 +594,12 @@ class AWMEnv:
         self._final_answer: str = ""
         self._verify_result: dict | None = None
 
-    def reset(self):
+    async def reset(self):
         """Reset DB, acquire/reuse MCP server, prepare for interaction.
 
         Uses the global ServerPool to reuse servers for the same scenario.
-        With NullPool in SQLAlchemy, replacing the .db file is sufficient —
-        no server restart needed for same-scenario tasks.
+        With NullPool in SQLAlchemy, replacing the leased slot's .db file is
+        sufficient — no server restart needed for same-scenario tasks.
         """
         assert _DATA_CACHE.loaded, "Call preload_awm_data() before creating envs"
 
@@ -409,27 +609,30 @@ class AWMEnv:
         self._final_answer = ""
         self._tools_listed = False
 
-        # Reset database (replace the .db file)
-        self._db_path = os.path.join(_DATA_CACHE.db_dir, f"{self.scenario}.db")
-        self._reset_db()
-
-        # Acquire server from pool (reuses if same scenario is already warm)
-        server_pool = get_server_pool(startup_timeout=self.server_startup_timeout)
-        self._slot = server_pool.acquire(self.scenario)
+        # Acquire an exclusive server slot for this scenario first, then
+        # reset that slot's dedicated database file.
+        server_pool = get_server_pool(
+            max_servers=self.server_pool_max_servers,
+            startup_timeout=self.server_startup_timeout,
+            acquire_poll_interval=self.server_pool_acquire_poll_interval,
+            startup_max_retries=self.server_startup_max_retries,
+        )
+        self._slot = await server_pool.acquire(self.scenario)
         self._tools_text = self._slot.tools_text  # cached from first startup
+        self._db_path = self._slot.db_path
+        await asyncio.to_thread(self._reset_db, self._db_path)
 
         # Save initial snapshot for verification (use port to avoid collisions)
         self._initial_db_path = os.path.join(
             _DATA_CACHE.db_dir, f"{self.scenario}_init_p{self._slot.port}.db"
         )
-        shutil.copy2(self._db_path, self._initial_db_path)
+        await asyncio.to_thread(shutil.copy2, self._db_path, self._initial_db_path)
 
-        # Create event loop and connect MCP executor
-        self._loop = asyncio.new_event_loop()
+        # Connect MCP executor within the running rollout event loop.
         self._mcp = MCPToolExecutor(self._slot.mcp_url, timeout=self.tool_timeout)
-        self._loop.run_until_complete(self._mcp.__aenter__())
+        await self._mcp.__aenter__()
 
-    def step(self, response_text: str) -> tuple[dict, bool, dict]:
+    async def step(self, response_text: str) -> tuple[dict, bool, dict]:
         """
         Process LLM response, execute tool calls, return observation.
 
@@ -480,9 +683,7 @@ class AWMEnv:
             info["tool_name"] = tool_name
             info["tool_args"] = tool_args
             try:
-                response_text = self._loop.run_until_complete(
-                    self._mcp.call_tool(tool_name, tool_args)
-                )
+                response_text = await self._mcp.call_tool(tool_name, tool_args)
             except asyncio.TimeoutError:
                 response_text = f"Error: Tool call timed out after {self.tool_timeout}s"
                 info["tool_error"] = "timeout"
@@ -497,7 +698,7 @@ class AWMEnv:
             "role": "tool",
             "tool_call_id": tool_call_id,
             "tool_name": info.get("tool_name", name),
-            "content": response_text[:2000],  # truncate for logging
+            "content": response_text,
         })
 
         obs = {
@@ -565,25 +766,23 @@ class AWMEnv:
             self.reward = 0.0
             return self.reward
 
-    def close(self):
+    async def close(self):
         """Release MCP server back to pool, clean up per-task resources.
 
         The server process is NOT killed — it stays warm in the pool
         for reuse by subsequent tasks on the same scenario.
         """
         # Close MCP connection (per-task, not per-server)
-        if self._mcp is not None and self._loop is not None:
+        if self._mcp is not None:
             try:
-                self._loop.run_until_complete(
-                    self._mcp.__aexit__(None, None, None)
-                )
+                await self._mcp.__aexit__(None, None, None)
             except Exception:
                 pass
             self._mcp = None
 
         # Release server slot back to pool (server stays alive)
         if self._slot is not None:
-            get_server_pool().release(self._slot.scenario)
+            get_server_pool().release(self._slot)
             self._slot = None
 
         # Clean up initial db snapshot
@@ -593,23 +792,9 @@ class AWMEnv:
             except OSError:
                 pass
 
-        # Close event loop
-        if self._loop is not None:
-            self._loop.close()
-            self._loop = None
-
-    def _reset_db(self):
+    def _reset_db(self, db_path: str):
         """Reset database to initial state using cached schema/sample data."""
-        schema_item = _DATA_CACHE.db_schemas.get(self.scenario)
-        if schema_item is None:
-            raise RuntimeError(f"Schema not found for {self.scenario}")
-
-        db_path, _, _, _ = create_sqlite_database(
-            self.scenario, schema_item["db_schema"], _DATA_CACHE.db_dir
-        )
-        sample_item = _DATA_CACHE.sample_data.get(self.scenario)
-        if sample_item:
-            execute_sample_data(db_path, sample_item["sample_data"], self.scenario)
+        _reset_db_file(self.scenario, db_path)
 
 
 
@@ -632,7 +817,10 @@ def build_env(sample=None, args: Any = None, **kwargs) -> AWMEnv:
         task=metadata["task"],
         task_idx=metadata["task_idx"],
         max_iterations=max_turns,
-        server_startup_timeout=getattr(args, "server_startup_timeout", 15.0) if args else 15.0,
+        server_startup_timeout=getattr(args, "server_startup_timeout", 30.0) if args else 30.0,
+        server_startup_max_retries=getattr(args, "server_startup_max_retries", 2) if args else 2,
+        server_pool_max_servers=getattr(args, "server_pool_max_servers", 8) if args else 8,
+        server_pool_acquire_poll_interval=getattr(args, "server_pool_acquire_poll_interval", 0.05) if args else 0.05,
         tool_timeout=getattr(args, "tool_timeout", 30.0) if args else 30.0,
     )
     return env
