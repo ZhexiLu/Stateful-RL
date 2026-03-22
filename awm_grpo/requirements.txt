@@ -1,60 +1,50 @@
 # AWM-GRPO Requirements
-# Tested on: Python 3.12, CUDA 12.8, 4× H200
 #
-# IMPORTANT: Install in this order:
-#   1. PyTorch (with CUDA)
-#   2. flash-attn (requires torch + CUDA toolkit)
-#   3. sglang[all] (pulls most inference deps)
-#   4. Everything else
+# Verified environment:
+#   Python 3.12.3 | CUDA 12.8 | Driver 570.195 | 4× H200
+#   Docker: slimerl/slime:latest (recommended — has most deps pre-installed)
 #
-# If using the slime Docker image (slimerl/slime:latest), most deps are
-# pre-installed. You only need to run: pip install -r requirements.txt
+# Install order matters! Follow these steps:
+#
+#   Step 1: PyTorch (skip if using slime Docker)
+#     pip install torch==2.9.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#
+#   Step 2: flash-attn (skip if using slime Docker)
+#     pip install flash-attn==2.8.3 --no-build-isolation
+#     # If build fails: pip install packaging ninja && retry
+#     # If still fails: use slime Docker image
+#
+#   Step 3: SGLang + Ray (skip if using slime Docker)
+#     pip install "sglang[all]==0.5.9" sglang-router==0.3.2 ray==2.54.0
+#
+#   Step 4: This file
+#     pip install -r requirements.txt
+#
+#   Step 5: Project packages (editable install)
+#     cd slime && pip install -e . --no-deps && cd ..
+#     cd agent-world-model && pip install -e . && cd ..
+#
 
-# ── Core ML Framework ──────────────────────────────────────────────────────
-# Install PyTorch first via: pip install torch torchvision torchaudio
-# Or use the CUDA-specific URL:
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# ── Core ML (should already be installed from steps above) ───────────────
 torch>=2.6.0
 torchvision
 torchaudio
-
-# ── Flash Attention (tricky to install) ────────────────────────────────────
-# flash-attn requires: torch, CUDA toolkit (nvcc), and a C++ compiler.
-#
-# Option A (recommended): Install pre-built wheel
-#   pip install flash-attn --no-build-isolation
-#
-# Option B: If Option A fails, build from source
-#   pip install packaging ninja
-#   pip install flash-attn --no-build-isolation --no-cache-dir
-#
-# Option C: Use the slime Docker image which has it pre-installed
-#
-# Common errors:
-#   - "No CUDA runtime found" → install cuda-toolkit: conda install cuda-toolkit -c nvidia
-#   - "nvcc not found" → export PATH=/usr/local/cuda/bin:$PATH
-#   - Build takes 20-40 min → use pre-built wheel or Docker
 flash-attn>=2.7.0
-
-# ── Inference Engine ───────────────────────────────────────────────────────
-sglang[all]>=0.5.0
+sglang>=0.5.0
 sglang-router>=0.3.0
-
-# ── Distributed Training ──────────────────────────────────────────────────
 ray>=2.40.0
-torch_memory_saver>=0.0.5
 
-# ── Model / Tokenizer ─────────────────────────────────────────────────────
+# ── Megatron / Training ─────────────────────────────────────────────────
+# megatron-core and mbridge are installed via slime Docker or pip
+mbridge>=0.15.0
+torch_memory_saver>=0.0.5
 transformers>=4.50.0
 huggingface_hub>=0.30.0
 tokenizers
 sentencepiece
+accelerate>=1.10.0
 
-# ── Megatron Bridge (HF <-> Megatron weight conversion) ────────────────────
-mbridge>=0.15.0
-
-# ── AWM Environment Dependencies ──────────────────────────────────────────
-# (also pulled by agent-world-model's pyproject.toml)
+# ── AWM Environment (MCP + DB + API) ────────────────────────────────────
 fastapi>=0.115.0
 fastapi-mcp>=0.4.0
 mcp>=1.20.0
@@ -63,10 +53,15 @@ sqlalchemy>=2.0.0
 uvicorn>=0.30.0
 httpx>=0.27.0
 aiohttp>=3.9.0
+loguru>=0.7.3
+json-repair>=0.56.0
+orjson>=3.11.0
 
-# ── Utilities ─────────────────────────────────────────────────────────────
+# ── Utilities ────────────────────────────────────────────────────────────
 PyYAML>=6.0
-numpy>=2.0.0
+numpy>=1.26.0
 tqdm>=4.60.0
 pybase64
 packaging
+wandb>=0.25.0         # optional: for experiment tracking
+tensorboard>=2.20.0   # optional: for local logging
