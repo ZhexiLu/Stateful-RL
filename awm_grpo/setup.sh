@@ -120,10 +120,21 @@ ok "${NUM_GPUS}× ${GPU_NAME}"
 CUDA_VER=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9.]+' || echo "unknown")
 ok "CUDA ${CUDA_VER}"
 
-# Check directories
+# Check directories — auto-clone Megatron-LM if missing
 [ -d "${SLIME_DIR}" ]   || fail "slime directory not found at ${SLIME_DIR}"
 [ -d "${AWM_DIR}" ]     || fail "agent-world-model directory not found at ${AWM_DIR}"
-[ -d "${MEGATRON_DIR}" ] || fail "Megatron-LM directory not found at ${MEGATRON_DIR}"
+if [ ! -d "${MEGATRON_DIR}" ]; then
+    echo "  Megatron-LM not found, cloning from NVIDIA/Megatron-LM..."
+    git clone --depth 1 https://github.com/NVIDIA/Megatron-LM.git "${MEGATRON_DIR}"
+    # Pin to tested commit for reproducibility
+    cd "${MEGATRON_DIR}"
+    git fetch --depth 1 origin 3714d81d418c9f1bca4594fc35f9e8289f652862
+    git checkout 3714d81d418c9f1bca4594fc35f9e8289f652862
+    cd "${PROJECT_ROOT}"
+    ok "Megatron-LM cloned (commit 3714d81)"
+else
+    ok "Megatron-LM found"
+fi
 ok "Project structure verified"
 
 # ============================================================================

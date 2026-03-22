@@ -126,10 +126,14 @@ If you prefer to understand each step, or if `setup.sh` fails at some point, fol
 
 Ensure you have Python 3.12, CUDA 12.4+, and `nvcc` available. See [requirements.txt](requirements.txt) for exact package versions and install order.
 
-### Step 1: Install Project Packages
+### Step 1: Clone Megatron-LM and Install Project Packages
 
 ```bash
 cd /workspace/Stateful-RL
+
+# Clone Megatron-LM (not included in this repo)
+git clone https://github.com/NVIDIA/Megatron-LM.git
+cd Megatron-LM && git checkout 3714d81d418c9f1bca4594fc35f9e8289f652862 && cd ..
 
 # Install slime (RL training framework)
 cd slime && pip install -e . --no-deps && cd ..
