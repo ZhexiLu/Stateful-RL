@@ -3,7 +3,7 @@
 # AWM-GRPO One-Click Setup Script (uv-based)
 #
 # Tested on:
-#   - Docker: slimerl/slime:latest (recommended) or bare Ubuntu 22.04/24.04
+#   - OS: Ubuntu 22.04 / 24.04 (or equivalent Linux with CUDA 12.4+)
 #   - GPU: H200 (4× recommended)
 #   - CUDA: 12.4+
 #   - Python: 3.12
@@ -186,13 +186,13 @@ if [ "${SKIP_DEPS}" = "0" ]; then
         uv pip install "numpy==1.26.4"
         # transformer-engine: PyPI prebuilt wheels have ABI issues with PyTorch cu128.
         # Must build from source to match the exact torch + CUDA versions.
-        # Requires: nvcc (CUDA toolkit), which is available in slime Docker.
+        # Requires: nvcc (CUDA toolkit).
         if python3 -c "import transformer_engine.pytorch" 2>/dev/null; then
             ok "transformer-engine already available"
         else
             echo "  Building transformer-engine from source (~3 minutes, requires nvcc)..."
             if ! command -v nvcc &>/dev/null; then
-                warn "nvcc not found. Install CUDA toolkit or use slime Docker image."
+                warn "nvcc not found. Install CUDA toolkit or set PATH to include nvcc."
                 warn "Skipping transformer-engine (training may fail without it)."
             else
                 uv pip install "transformer-engine[pytorch]" --no-build-isolation

@@ -76,29 +76,31 @@ ROLLOUT_BATCH_SIZE=8 SGLANG_MEM_FRACTION_STATIC=0.50 bash run_awm_grpo.sh
 | MCP server subprocesses (CPU-bound)| ~5 GB (16×)    | ~2.4 GB (8×)  |
 | **Total peak**                     | **~96 GB**     | **~65 GB**    |
 
+## Prerequisites
+
+- **OS**: Ubuntu 22.04 / 24.04 (or equivalent Linux)
+- **GPU**: NVIDIA GPU with CUDA 12.4+ (H200/H100/A100 tested)
+- **Python**: 3.12
+- **CUDA Toolkit**: `nvcc` must be in PATH (needed to build transformer-engine from source)
+- **uv**: Will be auto-installed by `setup.sh` if missing
+
 ## Quick Start (One-Click)
 
-The automated setup script handles everything: dependency check, data download, model download, checkpoint conversion, and training data preparation.
+The automated setup script handles everything: venv creation, dependency installation (via uv), data download, model download, checkpoint conversion, and training data preparation.
 
 ```bash
-# 1. Start from slime Docker (recommended)
-docker pull slimerl/slime:latest
-docker run --rm --gpus all --ipc=host --shm-size=16g \
-  --ulimit memlock=-1 --ulimit stack=67108864 \
-  -v /your/workspace:/workspace \
-  -it slimerl/slime:latest /bin/bash
-
-# 2. Clone the repo
-cd /workspace
-git clone https://github.com/<your-org>/Stateful-RL.git
+# 1. Clone the repo
+git clone https://github.com/ZhexiLu/Stateful-RL.git
 cd Stateful-RL
 
-# 3. Run one-click setup (~15 minutes)
+# 2. Run one-click setup (~15 minutes)
 cd awm_grpo
 bash setup.sh
 
+# 3. Activate the venv created by setup.sh
+source ../.venv_awm_grpo/bin/activate
+
 # 4. Run training
-source .env
 NUM_ROLLOUT=3 bash run_awm_grpo.sh     # Smoke test (~20 min)
 bash run_awm_grpo.sh                    # Full training (~24h on 4×H200)
 ```
@@ -113,23 +115,16 @@ bash run_awm_grpo.sh                    # Full training (~24h on 4×H200)
 | `--skip-convert`        | Skip HF→Megatron conversion                |
 | `--model-path /path`    | Use existing HF model at this path         |
 | `--model-dist-path /path` | Use existing Megatron checkpoint          |
+| `--venv /path`          | Custom venv path (default: `../.venv_awm_grpo`) |
 | `--num-gpus N`          | Override GPU count (default: auto-detect)  |
 
 ## Step-by-Step Setup (Manual)
 
 If you prefer to understand each step, or if `setup.sh` fails at some point, follow these manual steps.
 
-### Step 0: Docker Environment
+### Step 0: Environment
 
-```bash
-docker pull slimerl/slime:latest
-docker run --rm --gpus all --ipc=host --shm-size=16g \
-  --ulimit memlock=-1 --ulimit stack=67108864 \
-  -v /your/workspace:/workspace \
-  -it slimerl/slime:latest /bin/bash
-```
-
-The Docker image includes: PyTorch 2.9+, CUDA 12.8, flash-attn, SGLang, Ray, Megatron-Core, mbridge, transformer-engine. If not using Docker, install these manually (see [requirements.txt](requirements.txt) for versions).
+Ensure you have Python 3.12, CUDA 12.4+, and `nvcc` available. See [requirements.txt](requirements.txt) for exact package versions and install order.
 
 ### Step 1: Install Project Packages
 
@@ -239,7 +234,7 @@ python3 tools/convert_hf_to_torch_dist.py \
 cd ..
 ```
 
-> **Common error**: `gradient_accumulation_fusion` — add `--no-gradient-accumulation-fusion` (required when APEX fused kernels are not available, which is the default in most Docker images).
+> **Common error**: `gradient_accumulation_fusion` — add `--no-gradient-accumulation-fusion` (required when APEX fused kernels are not available, which is the common case).
 
 Verify the conversion:
 
