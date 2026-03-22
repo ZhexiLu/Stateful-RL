@@ -20,7 +20,7 @@ hardware:
 # ── Training ───────────────────────────────────────────────────────────────
 training:
   num_rollout: 100
-  rollout_batch_size: 16        # Aggressive: 16 prompts × 4 samples = 64 samples/rollout
+  rollout_batch_size: 12        # 12 prompts × 4 samples = 48 samples/rollout
   n_samples_per_prompt: 4
   rollout_temperature: 1.0
   save_interval: 20
@@ -42,13 +42,13 @@ grpo:
 # ── Inference (SGLang) ─────────────────────────────────────────────────────
 inference:
   max_response_length: 16384
-  gpu_memory_utilization: 0.65  # Push higher — 140GB has plenty of headroom
-  server_concurrency: 16        # More concurrent requests per engine
+  gpu_memory_utilization: 0.55  # Proven stable on 4×H200
+  server_concurrency: 8
 
 # ── AWM Environment ───────────────────────────────────────────────────────
 environment:
   max_turns: 15
-  server_pool_max_servers: 24   # More concurrent MCP servers for faster rollout
+  server_pool_max_servers: 16   # Proven stable on 4×H200
   server_startup_timeout: 30.0
   server_startup_max_retries: 2
   tool_timeout: 30.0
