@@ -1,0 +1,70 @@
+# ============================================================================
+# AWM-GRPO Training Configuration
+# ============================================================================
+# Edit this file to customize your training run.
+# All fields have sensible defaults — you only need to change what matters.
+# Run with:  bash run_awm_grpo.sh [--config config.yaml]
+# ============================================================================
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+paths:
+  hf_checkpoint: /workspace/models/Qwen3-4B           # HuggingFace model
+  ref_checkpoint: /workspace/models/Qwen3-4B_torch_dist  # Megatron format (for KL reference)
+  save_dir: ./checkpoints/awm_grpo                     # Where to save training checkpoints
+  # resume_checkpoint: ./checkpoints/awm_grpo           # Uncomment to resume from a previous run
+
+# ── Hardware ───────────────────────────────────────────────────────────────
+hardware:
+  num_gpus: auto            # "auto" = detect from nvidia-smi, or set manually (e.g. 4)
+  tp_size: 1                # Tensor parallel size. Keep 1 for models ≤ 8B.
+
+# ── Training ───────────────────────────────────────────────────────────────
+training:
+  num_rollout: 200          # Total rollout iterations (~24h on 4×H200 at 200)
+  rollout_batch_size: auto  # Prompts per rollout. "auto" adapts to GPU memory.
+  n_samples_per_prompt: 4   # Trajectories per prompt (GRPO group size)
+  rollout_temperature: 1.0  # Sampling temperature during rollout
+  save_interval: 10         # Save checkpoint every N rollouts
+  eval_interval: 10         # Run validation every N rollouts (0 = disable)
+
+# ── Optimizer ──────────────────────────────────────────────────────────────
+optimizer:
+  lr: 1e-6
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+
+# ── GRPO ───────────────────────────────────────────────────────────────────
+grpo:
+  kl_loss_coef: 0.001       # KL penalty coefficient (lower = less conservative)
+  eps_clip: 0.2             # PPO-style clipping range
+  eps_clip_high: 0.28       # Upper clipping range
+
+# ── Inference (SGLang) ─────────────────────────────────────────────────────
+inference:
+  max_response_length: auto    # Max tokens per trajectory. "auto" adapts to GPU memory.
+                               # H200: 16384, H100: 8192, A100-40G: 4096
+  gpu_memory_utilization: auto # Fraction of GPU memory allocated to SGLang (model + KV cache).
+                               # Similar to vLLM's --gpu-memory-utilization.
+                               # The rest is reserved for Megatron training.
+                               # "auto": H200→0.55, H100→0.45, A100-40G→0.35
+                               # Increase if rollout is slow (more KV cache).
+                               # Decrease if training OOMs (more room for gradients).
+  server_concurrency: auto     # Concurrent requests per SGLang engine.
+                               # H200: 8, H100: 4, A100-40G: 2
+
+# ── AWM Environment ───────────────────────────────────────────────────────
+environment:
+  max_turns: 15                  # Max tool-calling turns per episode
+  server_pool_max_servers: auto  # Concurrent MCP servers. "auto" adapts to GPU.
+                                 # H200: 16, H100: 8, A100-40G: 4
+  server_startup_timeout: 30.0   # Seconds to wait for MCP server to start
+  server_startup_max_retries: 2  # Retry count for failed server starts
+  tool_timeout: 30.0             # Timeout per tool call (seconds)
+
+# ── Logging ────────────────────────────────────────────────────────────────
+logging:
+  wandb_enabled: false
+  # wandb_project: awm-grpo
+  # wandb_group: qwen3-4B-vanilla
+  # wandb_key: your-key-here
