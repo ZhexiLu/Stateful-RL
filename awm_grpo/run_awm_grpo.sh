@@ -262,6 +262,8 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
+   --no-save-optim
+   --no-save-rng
 )
 
 # ── Generate runtime AWM config ──────────────────────────────────────────

@@ -8,24 +8,23 @@
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 paths:
-  hf_checkpoint: /workspace/models/Qwen3-4B           # HuggingFace model
-  ref_checkpoint: /workspace/models/Qwen3-4B_torch_dist  # Megatron format (for KL reference)
-  save_dir: ./checkpoints/awm_grpo                     # Where to save training checkpoints
-  # resume_checkpoint: ./checkpoints/awm_grpo           # Uncomment to resume from a previous run
+  hf_checkpoint: /workspace/models/Qwen3-4B
+  ref_checkpoint: /workspace/models/Qwen3-4B_torch_dist
+  save_dir: ./checkpoints/awm_grpo
 
 # ── Hardware ───────────────────────────────────────────────────────────────
 hardware:
-  num_gpus: auto            # "auto" = detect from nvidia-smi, or set manually (e.g. 4)
-  tp_size: 1                # Tensor parallel size. Keep 1 for models ≤ 8B.
+  num_gpus: 4
+  tp_size: 1
 
 # ── Training ───────────────────────────────────────────────────────────────
 training:
-  num_rollout: 200          # Total rollout iterations (~24h on 4×H200 at 200)
-  rollout_batch_size: auto  # Prompts per rollout. "auto" adapts to GPU memory.
-  n_samples_per_prompt: 4   # Trajectories per prompt (GRPO group size)
-  rollout_temperature: 1.0  # Sampling temperature during rollout
-  save_interval: 10         # Save checkpoint every N rollouts
-  eval_interval: 10         # Run validation every N rollouts (0 = disable)
+  num_rollout: 100
+  rollout_batch_size: 16        # Aggressive: 16 prompts × 4 samples = 64 samples/rollout
+  n_samples_per_prompt: 4
+  rollout_temperature: 1.0
+  save_interval: 20
+  eval_interval: 10
 
 # ── Optimizer ──────────────────────────────────────────────────────────────
 optimizer:
@@ -36,35 +35,26 @@ optimizer:
 
 # ── GRPO ───────────────────────────────────────────────────────────────────
 grpo:
-  kl_loss_coef: 0.001       # KL penalty coefficient (lower = less conservative)
-  eps_clip: 0.2             # PPO-style clipping range
-  eps_clip_high: 0.28       # Upper clipping range
+  kl_loss_coef: 0.001
+  eps_clip: 0.2
+  eps_clip_high: 0.28
 
 # ── Inference (SGLang) ─────────────────────────────────────────────────────
 inference:
-  max_response_length: auto    # Max tokens per trajectory. "auto" adapts to GPU memory.
-                               # H200: 16384, H100: 8192, A100-40G: 4096
-  gpu_memory_utilization: auto # Fraction of GPU memory allocated to SGLang (model + KV cache).
-                               # Similar to vLLM's --gpu-memory-utilization.
-                               # The rest is reserved for Megatron training.
-                               # "auto": H200→0.55, H100→0.45, A100-40G→0.35
-                               # Increase if rollout is slow (more KV cache).
-                               # Decrease if training OOMs (more room for gradients).
-  server_concurrency: auto     # Concurrent requests per SGLang engine.
-                               # H200: 8, H100: 4, A100-40G: 2
+  max_response_length: 16384
+  gpu_memory_utilization: 0.65  # Push higher — 140GB has plenty of headroom
+  server_concurrency: 16        # More concurrent requests per engine
 
 # ── AWM Environment ───────────────────────────────────────────────────────
 environment:
-  max_turns: 15                  # Max tool-calling turns per episode
-  server_pool_max_servers: auto  # Concurrent MCP servers. "auto" adapts to GPU.
-                                 # H200: 16, H100: 8, A100-40G: 4
-  server_startup_timeout: 30.0   # Seconds to wait for MCP server to start
-  server_startup_max_retries: 2  # Retry count for failed server starts
-  tool_timeout: 30.0             # Timeout per tool call (seconds)
+  max_turns: 15
+  server_pool_max_servers: 24   # More concurrent MCP servers for faster rollout
+  server_startup_timeout: 30.0
+  server_startup_max_retries: 2
+  tool_timeout: 30.0
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging:
-  wandb_enabled: false
-  # wandb_project: awm-grpo
-  # wandb_group: qwen3-4B-vanilla
-  # wandb_key: your-key-here
+  wandb_enabled: true
+  wandb_project: awm-grpo
+  wandb_group: qwen3-4B-vanilla
