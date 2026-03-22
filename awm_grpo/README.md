@@ -49,22 +49,32 @@ Vanilla GRPO training for tool-calling agents on [AgentWorldModel-1K](https://hu
 
 ## Hardware Requirements
 
-| Config         | GPUs          | VRAM/GPU | Notes                                       |
-|----------------|---------------|----------|---------------------------------------------|
-| **Recommended**| 4× H200/H100  | 80+ GB   | TP=1, 4 SGLang engines, best throughput      |
-| Minimum        | 2× H100       | 80 GB    | TP=1, 2 SGLang engines, ~2× slower rollout   |
+The launch script **auto-detects GPU memory** and adjusts batch size, sequence length, and SGLang memory fraction accordingly. No manual tuning needed.
+
+| GPU         | VRAM  | Profile  | Auto Config                                         |
+|-------------|-------|----------|-----------------------------------------------------|
+| H200        | 140 GB| `large`  | batch=8, max_resp=16384, mem_frac=0.55, servers=16  |
+| H100 / A100 | 80 GB | `medium` | batch=4, max_resp=8192, mem_frac=0.45, servers=8    |
+| A100-40GB   | 40 GB | `small`  | batch=2, max_resp=4096, mem_frac=0.35, servers=4    |
+
+You can always override any setting via environment variables:
+
+```bash
+# Example: force large batch on H100
+ROLLOUT_BATCH_SIZE=8 SGLANG_MEM_FRACTION_STATIC=0.50 bash run_awm_grpo.sh
+```
 
 > Qwen3-4B (~8 GB weights) fits on a single GPU. Using TP=1 (no tensor parallelism) maximizes data parallelism — each GPU runs its own independent SGLang inference engine.
 
-### Memory Budget (per GPU, H200 140 GB)
+### Memory Budget (per GPU)
 
-| Component                          | Memory      |
-|------------------------------------|-------------|
-| SGLang model weights (Qwen3-4B bf16)| ~8 GB      |
-| SGLang KV cache                    | ~30-50 GB   |
-| Megatron training (offloaded during rollout) | ~26 GB |
-| MCP server subprocesses (CPU-bound)| ~0.3 GB each|
-| **Total peak**                     | **~85 GB**  |
+| Component                          | H200 (140 GB) | H100 (80 GB) |
+|------------------------------------|----------------|---------------|
+| SGLang model weights (Qwen3-4B bf16)| ~8 GB         | ~8 GB         |
+| SGLang KV cache                    | ~50 GB         | ~28 GB        |
+| Megatron training (peak, during train phase) | ~50 GB | ~35 GB   |
+| MCP server subprocesses (CPU-bound)| ~5 GB (16×)    | ~2.4 GB (8×)  |
+| **Total peak**                     | **~96 GB**     | **~65 GB**    |
 
 ## Quick Start (One-Click)
 
@@ -337,12 +347,12 @@ bash run_awm_grpo.sh
 | `NUM_GPUS` | 4 | Total GPUs (auto-detected) |
 | `NUM_ROLLOUT` | 200 | Total rollout iterations |
 | `TP_SIZE` | 1 | Tensor parallel size. Keep 1 for 4B model. |
-| `ROLLOUT_BATCH_SIZE` | 8 | Prompts sampled per rollout |
+| `ROLLOUT_BATCH_SIZE` | 8/4/2 (auto) | Prompts sampled per rollout |
 | `N_SAMPLES_PER_PROMPT` | 4 | Trajectories per prompt (GRPO group size) |
-| `GLOBAL_BATCH_SIZE` | 32 | Must equal ROLLOUT_BATCH_SIZE × N_SAMPLES_PER_PROMPT |
-| `ROLLOUT_MAX_RESPONSE_LEN` | 16384 | Max tokens per trajectory. **Must be ≥16384 for Qwen3** (its `<think>` block consumes 2-4k tokens before any tool call) |
-| `SGLANG_MEM_FRACTION_STATIC` | 0.55 | GPU memory fraction for SGLang. Lower = more KV cache for long sequences. |
-| `SGLANG_SERVER_CONCURRENCY` | 8 | Concurrent requests per SGLang engine |
+| `GLOBAL_BATCH_SIZE` | auto | Must equal ROLLOUT_BATCH_SIZE × N_SAMPLES_PER_PROMPT |
+| `ROLLOUT_MAX_RESPONSE_LEN` | 16384/8192/4096 (auto) | Max tokens per trajectory. Qwen3 `<think>` needs ≥8192. |
+| `SGLANG_MEM_FRACTION_STATIC` | 0.55/0.45/0.35 (auto) | GPU memory fraction for SGLang. Lower = more KV cache for long sequences. |
+| `SGLANG_SERVER_CONCURRENCY` | 8/4/2 (auto) | Concurrent requests per SGLang engine |
 | `SAVE_INTERVAL` | 10 | Save checkpoint every N rollouts |
 | `EVAL_INTERVAL` | 10 | Run validation every N rollouts |
 
@@ -351,7 +361,7 @@ bash run_awm_grpo.sh
 | Key | Default | Description |
 |-----|---------|-------------|
 | `max_turns` | 15 | Max tool-calling turns per episode |
-| `server_pool_max_servers` | 16 | Max concurrent MCP server subprocesses. **This is the real concurrency bottleneck.** Lower if OOM, raise if GPUs idle. |
+| `server_pool_max_servers` | 16/8/4 (auto) | Max concurrent MCP server subprocesses. **This is the real concurrency bottleneck.** Lower if OOM, raise if GPUs idle. |
 | `server_startup_timeout` | 30.0 | Seconds to wait for MCP server readiness |
 | `server_startup_max_retries` | 2 | Retry count for failed server starts |
 | `tool_timeout` | 30.0 | Timeout per tool call |
