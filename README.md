@@ -4,60 +4,54 @@ Reinforcement learning framework for training tool-using agents in **stateful en
 
 Built on [AgentWorldModel-1K](https://huggingface.co/datasets/Snowflake/AgentWorldModel-1K) (1,000 synthetic SQL-backed tool-use environments) and [slime](https://github.com/THUDM/slime) (distributed RL training with Megatron + SGLang).
 
+## Quick Start
+
+**Requirements:** Linux with 2+ NVIDIA GPUs (tested on 4× H200/H100), CUDA 12.x, and `nvcc` available.
+
+```bash
+# Clone the repo
+git clone --recursive git@github.com:ZhexiLu/Stateful-RL.git
+cd Stateful-RL
+
+# One-click setup: creates venv, installs all dependencies, downloads model & data
+cd awm_grpo
+bash setup.sh
+
+# Activate the environment
+source ../.venv_awm_grpo/bin/activate
+
+# Quick smoke test (~20 minutes)
+NUM_ROLLOUT=3 bash run_awm_grpo.sh
+
+# Full training (~24 hours on 4× H200)
+bash run_awm_grpo.sh
+```
+
+That's it. `setup.sh` handles everything automatically:
+- Creates a Python 3.12 venv with all dependencies (PyTorch, SGLang, Megatron-LM, etc.)
+- Downloads the Qwen3-4B model from HuggingFace
+- Converts the model to Megatron torch_dist format
+- Downloads the AWM-1K dataset and generates SQLite databases
+- Prepares train/val/test splits
+
+Run `bash setup.sh --help` for advanced options (custom model path, GPU count, etc.).
+
 ## Project Structure
 
 ```
 Stateful-RL/
 ├── agent-world-model/     # AWM: synthetic environment generation framework
 │   ├── awm/               #   Core: DB, MCP server, verifier, tool execution
-│   └── outputs/            #   Generated data (download from HuggingFace)
-├── slime/                  # slime: RL training framework (Megatron + SGLang + Ray)
-├── Megatron-LM/            # Megatron-LM (training backend)
-└── awm_grpo/               # ★ AWM-GRPO: multi-turn GRPO training on AWM
-    ├── run_awm_grpo.sh     #   Main launch script
-    ├── env_awm.py          #   AWM environment wrapper
-    ├── rollout.py          #   Custom multi-turn rollout
-    ├── reward.py           #   Reward function (verification-based)
-    ├── data_prep.py        #   Data preparation
-    └── README.md           #   Detailed setup & usage guide
-```
-
-## Quick Start
-
-See [awm_grpo/README.md](awm_grpo/README.md) for full setup instructions.
-
-**TL;DR** (assuming Docker with 4× H200 GPUs):
-
-```bash
-# 1. Pull slime Docker image
-docker pull slimerl/slime:latest
-docker run --rm --gpus all --ipc=host --shm-size=16g \
-  -v $(pwd):/workspace -it slimerl/slime:latest /bin/bash
-
-# 2. Install
-cd /workspace/Stateful-RL
-cd slime && pip install -e . --no-deps && cd ..
-cd agent-world-model && pip install -e . && cd ..
-pip install -r awm_grpo/requirements.txt
-
-# 3. Download AWM data
-huggingface-cli download Snowflake/AgentWorldModel-1K \
-  --repo-type dataset --local-dir agent-world-model/outputs
-
-# 4. Download & convert model
-huggingface-cli download Qwen/Qwen3-4B --local-dir /workspace/models/Qwen3-4B
-cd slime && source scripts/models/qwen3-4B.sh
-PYTHONPATH=$(pwd)/../Megatron-LM:$(pwd) CUDA_DEVICE_MAX_CONNECTIONS=1 \
-python tools/convert_hf_to_torch_dist.py "${MODEL_ARGS[@]}" \
-  --no-gradient-accumulation-fusion \
-  --hf-checkpoint /workspace/models/Qwen3-4B \
-  --save /workspace/models/Qwen3-4B_torch_dist && cd ..
-
-# 5. Prepare data & train
-cd awm_grpo
-PYTHONPATH=../agent-world-model:. python data_prep.py
-HF_CKPT=/workspace/models/Qwen3-4B REF_CKPT=/workspace/models/Qwen3-4B_torch_dist \
-  NUM_ROLLOUT=3 bash run_awm_grpo.sh
+│   └── outputs/           #   Generated data (downloaded by setup.sh)
+├── slime/                 # slime: RL training framework (Megatron + SGLang + Ray)
+├── Megatron-LM/           # Megatron-LM (training backend, cloned by setup.sh)
+└── awm_grpo/              # AWM-GRPO: multi-turn GRPO training on AWM
+    ├── setup.sh           #   One-click setup script
+    ├── run_awm_grpo.sh    #   Main launch script
+    ├── env_awm.py         #   AWM environment wrapper
+    ├── rollout.py         #   Custom multi-turn rollout
+    ├── reward.py          #   Reward function (verification-based)
+    └── data_prep.py       #   Data preparation
 ```
 
 ## Citation
