@@ -112,6 +112,7 @@ class AWMDataCache:
     db_schemas: dict[str, dict] = field(default_factory=dict)
     sample_data: dict[str, dict] = field(default_factory=dict)
     verifiers: dict[str, dict] = field(default_factory=dict)
+    envs_data: dict[str, dict] = field(default_factory=dict)   # full_code per scenario
     envs_path: str = ""
     db_dir: str = ""
     template_db_dir: str = ""
@@ -154,6 +155,10 @@ def preload_awm_data(
         scenario = normalize_scenario_name(item["scenario"])
         task_idx = item["task_idx"]
         _DATA_CACHE.verifiers[f"{scenario}::{task_idx}"] = item
+
+    # Cache envs data (full_code) so server subprocesses don't re-read the 100MB file
+    for item in tools_jsonl_load(envs_path):
+        _DATA_CACHE.envs_data[normalize_scenario_name(item["scenario"])] = item
 
     _DATA_CACHE.envs_path = envs_path
     _DATA_CACHE.db_dir = db_dir
@@ -207,7 +212,179 @@ def _reset_db_file(scenario: str, db_path: str) -> str:
     return db_path
 
 
+# ── Pre-fork server launcher ──────────────────────────────────────────────
+
+class _ServerLauncher:
+    """Persistent launcher that pre-imports heavy Python modules once,
+    then fork()s children that inherit them instantly (~0s vs ~4s)."""
+
+    def __init__(self):
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+
+    def _ensure_started(self):
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        launcher_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "_server_launcher.py",
+        )
+        self._proc = subprocess.Popen(
+            [sys.executable, launcher_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        line = self._proc.stdout.readline()
+        resp = json.loads(line)
+        if resp.get("status") != "ready":
+            raise RuntimeError(f"Launcher failed to start: {resp}")
+
+    def start_server(
+        self, script_path: str, log_path: str, env_vars: dict | None = None,
+    ) -> int:
+        """Fork a child to run *script_path*.  Returns child PID."""
+        with self._lock:
+            self._ensure_started()
+            self._proc.stdin.write(json.dumps({
+                "script": script_path,
+                "log": log_path,
+                "env": env_vars or {},
+            }) + "\n")
+            self._proc.stdin.flush()
+            line = self._proc.stdout.readline()
+            resp = json.loads(line)
+            if "error" in resp:
+                raise RuntimeError(f"Launcher error: {resp['error']}")
+            return resp["pid"]
+
+    def shutdown(self):
+        if self._proc is not None:
+            try:
+                self._proc.stdin.close()
+                self._proc.terminate()
+                self._proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+
+
+class _PidProcess:
+    """Thin wrapper around a PID to match subprocess.Popen interface."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.returncode = None
+        self._log_handle = None
+        self._log_path = None
+
+    def poll(self):
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            os.kill(self.pid, 0)
+            return None
+        except ProcessLookupError:
+            self.returncode = 0
+            return 0
+
+    def kill(self):
+        for sig_func, sig in [(os.killpg, signal.SIGKILL), (os.kill, signal.SIGKILL)]:
+            try:
+                sig_func(self.pid, sig)
+                return
+            except (ProcessLookupError, PermissionError):
+                continue
+
+    def terminate(self):
+        for sig_func, sig in [(os.killpg, signal.SIGTERM), (os.kill, signal.SIGTERM)]:
+            try:
+                sig_func(self.pid, sig)
+                return
+            except (ProcessLookupError, PermissionError):
+                continue
+
+    def wait(self, timeout=None):
+        deadline = time.time() + (timeout if timeout is not None else 3600)
+        while time.time() < deadline:
+            if self.poll() is not None:
+                return self.returncode
+            time.sleep(0.05)
+        raise subprocess.TimeoutExpired(cmd="server", timeout=timeout)
+
+
+_LAUNCHER: _ServerLauncher | None = None
+
+
+def get_server_launcher() -> _ServerLauncher:
+    global _LAUNCHER
+    if _LAUNCHER is None:
+        _LAUNCHER = _ServerLauncher()
+    return _LAUNCHER
+
+
 # ── Server pool: reuse MCP servers across tasks of the same scenario ─────────
+
+def _write_server_script(scenario: str, db_path: str, host: str, port: int) -> str:
+    """Generate a temp server script from cached envs data.
+
+    Avoids the 100MB gen_envs.jsonl read per subprocess by using
+    data already loaded into _DATA_CACHE.  Uses a unique filename
+    per port to prevent race conditions between concurrent starts.
+    """
+    import textwrap
+
+    env_item = _DATA_CACHE.envs_data.get(scenario)
+    if env_item is None:
+        raise RuntimeError(f"No cached envs data for scenario: {scenario}")
+
+    code = env_item["full_code"]
+    new_code = [
+        "import warnings",
+        'warnings.filterwarnings("ignore", category=DeprecationWarning)',
+        "from sqlalchemy.pool import NullPool",
+    ]
+    for line in code.split("\n"):
+        if "create_engine(" in line:
+            left = line.split("create_engine(")[0]
+            sql_path = f"'sqlite:///{db_path}'"
+            right = (
+                f"create_engine({sql_path}, "
+                f"connect_args={{'check_same_thread': False}}, poolclass=NullPool)"
+            )
+            line = f"{left}{right}"
+
+        if "uvicorn.run(app" in line:
+            mcp_setup = textwrap.dedent(f"""\
+                import os
+                host = os.environ.get('HOST', '{host}')
+                port = os.environ.get('PORT', {port})
+                print(f'Server starting on port={{port}}')
+                from fastapi_mcp import FastApiMCP
+                mcp = FastApiMCP(app)
+                mcp.mount_http()
+                print("MCP server enabled on http://{host}:{port}/mcp")
+            """)
+            new_code.extend(
+                textwrap.indent(mcp_setup, "    ").rstrip().split("\n")
+            )
+            line = "    uvicorn.run(app, host=host, port=int(port))"
+
+        new_code.append(line)
+
+    # Use /dev/shm (RAM) for temp scripts — avoids NFS metadata latency
+    script_dir = os.path.join("/dev/shm", f"awm_server_scripts_{os.getuid()}")
+    os.makedirs(script_dir, exist_ok=True)
+    script_path = os.path.join(script_dir, f"temp_server_{scenario}_{port}.py")
+    with open(script_path, "w") as f:
+        f.write("\n".join(new_code))
+
+    return script_path
+
 
 @dataclass
 class _ServerSlot:
@@ -218,6 +395,7 @@ class _ServerSlot:
     proc: subprocess.Popen
     mcp_url: str
     tools_text: str  # cached list_tools output (same per scenario)
+    script_path: str = ""
     last_used: float = 0.0
 
 
@@ -315,13 +493,15 @@ class ServerPool:
             slot.last_used = time.time()
 
     def shutdown_all(self):
-        """Stop all servers. Call on process exit."""
+        """Stop all servers and the pre-fork launcher. Call on process exit."""
         with self._lock:
             for slots in self._slots.values():
                 for slot in slots:
                     self._stop_slot(slot)
             self._slots.clear()
             self._busy.clear()
+        if _LAUNCHER is not None:
+            _LAUNCHER.shutdown()
 
     def _evict_one_locked(self):
         """Evict the least-recently-used non-busy slot. Must hold _lock."""
@@ -388,37 +568,26 @@ class ServerPool:
             try:
                 await asyncio.to_thread(_reset_db_file, scenario, db_path)
                 script_dir = AWM_ROOT
-                log_dir = os.path.join(script_dir, "outputs", "server_logs")
+                log_dir = os.path.join("/dev/shm", f"awm_server_logs_{os.getuid()}")
                 os.makedirs(log_dir, exist_ok=True)
                 log_path = os.path.join(log_dir, f"{scenario}_{port}.log")
-                log_handle = open(log_path, "wb")
 
                 _kill_port(port)
-                cmd = [
-                    sys.executable, "-c",
-                    f"""
-import sys
-sys.path.insert(0, '{AWM_ROOT}')
-from awm.core.server import Config, run_server
-config = Config(
-    scenario='{scenario}',
-    envs_load_path='{_DATA_CACHE.envs_path}',
-    db_path='{db_path}',
-    host='127.0.0.1',
-    port={port},
-)
-config.pre_process()
-run_server(config)
-"""
-                ]
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=script_dir,
-                    stdout=log_handle,
-                    stderr=log_handle,
-                    env={**os.environ, **_THREAD_LIMIT_ENV},
+
+                # Generate server script from cached data (avoids 100MB
+                # gen_envs.jsonl read per subprocess — critical on shared FS).
+                server_script = _write_server_script(
+                    scenario, db_path, "127.0.0.1", port,
                 )
-                proc._log_handle = log_handle
+
+                # Use pre-fork launcher: child inherits pre-imported
+                # modules (~0s import vs ~4s cold start).
+                launcher = get_server_launcher()
+                child_pid = await asyncio.to_thread(
+                    launcher.start_server,
+                    server_script, log_path, _THREAD_LIMIT_ENV,
+                )
+                proc = _PidProcess(child_pid)
                 proc._log_path = log_path
 
                 mcp_url = f"http://127.0.0.1:{port}/mcp"
@@ -437,7 +606,8 @@ run_server(config)
 
                 return _ServerSlot(
                     scenario=scenario, port=port, db_path=db_path, proc=proc,
-                    mcp_url=mcp_url, tools_text=tools_text, last_used=time.time(),
+                    mcp_url=mcp_url, tools_text=tools_text,
+                    script_path=server_script, last_used=time.time(),
                 )
             except Exception as e:
                 last_error = e
@@ -488,6 +658,11 @@ run_server(config)
         if slot.db_path and os.path.exists(slot.db_path):
             try:
                 os.remove(slot.db_path)
+            except OSError:
+                pass
+        if slot.script_path and os.path.exists(slot.script_path):
+            try:
+                os.remove(slot.script_path)
             except OSError:
                 pass
         _kill_port(slot.port)

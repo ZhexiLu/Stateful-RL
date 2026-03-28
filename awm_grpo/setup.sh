@@ -17,6 +17,10 @@
 #   bash setup.sh --num-gpus 2             # Override GPU count
 #   bash setup.sh --venv /my/venv          # Custom venv path (default: ../.venv_awm_grpo)
 #
+# Two-phase setup for HPC (login node has network, compute node has GPU):
+#   bash setup.sh --phase1                 # Login node: venv + deps + data prep (no GPU needed)
+#   sbatch setup_slurm.sh                  # GPU node:   model conversion + GPU verification
+#
 # After setup completes, run training with:
 #   source ../.venv_awm_grpo/bin/activate
 #   bash run_awm_grpo.sh                   # Full training (200 rollouts, ~24h on 4×H200)
@@ -41,19 +45,22 @@ MODEL_DIR="${MODEL_DIR:-${PROJECT_ROOT}/models/${MODEL_NAME}}"
 MODEL_DIST_DIR="${MODEL_DIST_DIR:-${PROJECT_ROOT}/models/${MODEL_NAME}_torch_dist}"
 AWM_DATA_REPO="${AWM_DATA_REPO:-Snowflake/AgentWorldModel-1K}"
 AWM_OUTPUTS_DIR="${AWM_DIR}/outputs"
-NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
+NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 
 SKIP_MODEL_DOWNLOAD=0
 SKIP_DATA_DOWNLOAD=0
 SKIP_DEPS=0
 SKIP_CONVERT=0
+PHASE=""
 
 # ============================================================================
 # Parse arguments
 # ============================================================================
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --phase1)              PHASE="1"; shift ;;
+        --phase2)              PHASE="2"; shift ;;
         --skip-model-download) SKIP_MODEL_DOWNLOAD=1; shift ;;
         --skip-data-download)  SKIP_DATA_DOWNLOAD=1; shift ;;
         --skip-deps)           SKIP_DEPS=1; shift ;;
@@ -63,12 +70,25 @@ while [[ $# -gt 0 ]]; do
         --num-gpus)            NUM_GPUS="$2"; shift 2 ;;
         --venv)                VENV_DIR="$2"; shift 2 ;;
         --help|-h)
-            head -30 "$0" | grep "^#" | sed 's/^# \?//'
+            head -35 "$0" | grep "^#" | sed 's/^# \?//'
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Phase mode: auto-set skip flags
+if [ "${PHASE}" = "1" ]; then
+    # Login node: deps + data, skip GPU-dependent steps
+    SKIP_CONVERT=1
+    echo "=== Phase 1: Login node setup (no GPU required) ==="
+elif [ "${PHASE}" = "2" ]; then
+    # GPU node: model conversion only, skip downloads and deps
+    SKIP_MODEL_DOWNLOAD=1
+    SKIP_DATA_DOWNLOAD=1
+    SKIP_DEPS=1
+    echo "=== Phase 2: GPU node setup (model conversion + verification) ==="
+fi
 
 # ============================================================================
 # Helpers
@@ -109,16 +129,21 @@ fi
 
 command -v git &>/dev/null || fail "git not found"
 
-# Check GPU
+# Check GPU (optional in phase 1)
 if [ "${NUM_GPUS}" -lt 1 ]; then
-    fail "No GPUs detected. This training requires at least 2 GPUs."
+    if [ "${PHASE}" = "1" ]; then
+        warn "No GPUs detected (OK for phase 1, GPU needed in phase 2)"
+        GPU_NAME="none"
+        CUDA_VER="unknown"
+    else
+        fail "No GPUs detected. This training requires at least 1 GPU."
+    fi
+else
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+    ok "${NUM_GPUS}× ${GPU_NAME}"
+    CUDA_VER=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9.]+' || echo "unknown")
+    ok "CUDA ${CUDA_VER}"
 fi
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
-ok "${NUM_GPUS}× ${GPU_NAME}"
-
-# Check CUDA
-CUDA_VER=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9.]+' || echo "unknown")
-ok "CUDA ${CUDA_VER}"
 
 # Check directories — auto-clone Megatron-LM if missing
 [ -d "${SLIME_DIR}" ]   || fail "slime directory not found at ${SLIME_DIR}"
@@ -159,7 +184,7 @@ if [ "${SKIP_DEPS}" = "0" ]; then
             "torch==2.9.1" \
             "torchvision==0.24.1" \
             "torchaudio==2.9.1" \
-            --index-url https://download.pytorch.org/whl/cu128
+            --index-url https://download.pytorch.org/whl/cu126
         ok "PyTorch installed"
 
         # ── Phase 2: flash-attn (needs torch + psutil + wheel at build time)
@@ -266,7 +291,7 @@ if [ "${SKIP_DEPS}" = "0" ]; then
 import sys
 failures = []
 checks = [
-    ('torch',           'import torch; assert torch.cuda.is_available()'),
+    ('torch',           'import torch; assert torch.cuda.is_available()' if '${PHASE}' != '1' else 'import torch'),
     ('flash_attn',      'import flash_attn'),
     ('sglang',          'import sglang'),
     ('ray',             'import ray'),
@@ -484,19 +509,25 @@ echo "    Training Data:    ${DATA_DIR}"
 echo "    Config:           ${CONFIG_FILE}"
 echo "    GPUs:             ${NUM_GPUS}× ${GPU_NAME}"
 echo ""
-echo "  Next steps:"
-echo ""
-echo -e "    ${YELLOW}# Activate the venv${NC}"
-echo "    source ${VENV_DIR}/bin/activate"
-echo ""
-echo -e "    ${YELLOW}# Quick smoke test (~20 minutes)${NC}"
-echo "    cd ${SCRIPT_DIR}"
-echo "    NUM_ROLLOUT=3 bash run_awm_grpo.sh"
-echo ""
-echo -e "    ${YELLOW}# Full training (~24 hours on 4× H200)${NC}"
-echo "    cd ${SCRIPT_DIR}"
-echo "    bash run_awm_grpo.sh"
-echo ""
-echo -e "    ${YELLOW}# Monitor via Ray dashboard${NC}"
-echo "    open http://localhost:8265"
-echo ""
+if [ "${PHASE}" = "1" ]; then
+    echo "  Next step: submit GPU job for phase 2 (model conversion)"
+    echo ""
+    echo -e "    ${YELLOW}# Submit phase 2 to SLURM${NC}"
+    echo "    cd ${SCRIPT_DIR}"
+    echo "    sbatch setup_slurm.sh"
+    echo ""
+else
+    echo "  Next steps:"
+    echo ""
+    echo -e "    ${YELLOW}# Activate the venv${NC}"
+    echo "    source ${VENV_DIR}/bin/activate"
+    echo ""
+    echo -e "    ${YELLOW}# Quick smoke test (~20 minutes)${NC}"
+    echo "    cd ${SCRIPT_DIR}"
+    echo "    NUM_ROLLOUT=3 bash run_awm_grpo.sh"
+    echo ""
+    echo -e "    ${YELLOW}# Full training (~24 hours on 4× H200)${NC}"
+    echo "    cd ${SCRIPT_DIR}"
+    echo "    bash run_awm_grpo.sh"
+    echo ""
+fi

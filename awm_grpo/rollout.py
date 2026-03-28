@@ -10,6 +10,9 @@ This rollout function drives the agent-environment loop:
 """
 from __future__ import annotations
 
+import faulthandler, sys
+faulthandler.enable(file=sys.stderr, all_threads=True)
+
 import asyncio
 import logging
 import os

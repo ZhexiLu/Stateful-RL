@@ -104,6 +104,13 @@ ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${D_TOK}}"
 ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-${NUM_GPUS}}"
+TRAIN_NUM_GPUS="${TRAIN_NUM_GPUS:-${NUM_GPUS}}"
+# Colocate mode: set COLOCATE=0 to use separate GPUs for rollout and training
+if [ "${COLOCATE:-1}" = "1" ]; then
+    COLOCATE_FLAG="--colocate"
+else
+    COLOCATE_FLAG=""
+fi
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-${D_MEM}}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-${D_CONC}}"
@@ -266,6 +273,14 @@ MISC_ARGS=(
    --no-save-rng
 )
 
+# ── Use /dev/shm (RAM) for MCP databases — fastest for small file I/O ────
+# SQLite on NFS is extremely slow for the metadata-heavy access patterns
+# used by MCP servers.  /dev/shm is in-memory and ideal for this.
+# Typical usage: <200 MB total (16 servers × small DBs).
+AWM_LOCAL_DB_DIR="/dev/shm/awm_databases_${USER}"
+mkdir -p "${AWM_LOCAL_DB_DIR}"
+echo "Using /dev/shm (RAM) for MCP databases: ${AWM_LOCAL_DB_DIR}"
+
 # ── Generate runtime AWM config ──────────────────────────────────────────
 AWM_RUNTIME_CONFIG="${SCRIPT_DIR}/.awm_config_runtime.yaml"
 cat > "${AWM_RUNTIME_CONFIG}" << YAML_EOF
@@ -285,7 +300,7 @@ awm_db_schema_path: ${AWM_DIR}/outputs/gen_db.jsonl
 awm_sample_path: ${AWM_DIR}/outputs/gen_sample.jsonl
 awm_verifier_path: ${AWM_DIR}/outputs/gen_verifier.pure_code.jsonl
 awm_envs_path: ${AWM_DIR}/outputs/gen_envs.jsonl
-awm_db_dir: ${AWM_DIR}/outputs/databases
+awm_db_dir: ${AWM_LOCAL_DB_DIR}
 YAML_EOF
 
 # ── Custom args (AWM rollout + reward) ────────────────────────────────────
