@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# ESA (Execution-Status Awareness) RL training with Qwen3-4B on slime.
+# ESA (Execution-Status Awareness) RL training with Qwen2.5-7B-Instruct on slime.
 #
 # Three-step workflow:
 #   1. Extract predicates:  python examples/awm_esa/predicate_extractor.py
@@ -16,7 +16,7 @@ pkill -9 sglang 2>/dev/null || true
 ray stop --force 2>/dev/null || true
 pkill -9 ray 2>/dev/null || true
 pkill -9 -f "server_.*\.py" 2>/dev/null || true
-for port in $(seq 9100 9227); do fuser -k ${port}/tcp 2>/dev/null || true; done
+for port in $(seq 9100 9147); do fuser -k ${port}/tcp 2>/dev/null || true; done
 rm -rf /dev/shm/awm_databases /dev/shm/awm_scripts_* /dev/shm/awm_logs_*
 sleep 3
 
@@ -34,7 +34,7 @@ AWM_DIR="${SLIME_DIR}/../agent-world-model"
 MEGATRON_DIR="${SLIME_DIR}/../Megatron-LM"
 LOG_DIR="${SCRIPT_DIR}/logs"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
-RUN_LOG="${RUN_LOG:-${LOG_DIR}/run_qwen3_4B_${RUN_TS}.log}"
+RUN_LOG="${RUN_LOG:-${LOG_DIR}/run_qwen2.5_7B_${RUN_TS}.log}"
 VLLM_LOG="${VLLM_LOG:-${LOG_DIR}/vllm_judge_${RUN_TS}.log}"
 
 mkdir -p "${LOG_DIR}"
@@ -88,13 +88,17 @@ if [ ! -f "${TRAIN_DATA}" ]; then
 fi
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-HF_CKPT="${HF_CKPT:-${SLIME_DIR}/../models/Qwen3-4B}"
-REF_CKPT="${REF_CKPT:-${SLIME_DIR}/../models/Qwen3-4B_torch_dist}"
+HF_CKPT="${HF_CKPT:-${SLIME_DIR}/../models/Qwen2.5-7B-Instruct}"
+
+# Download model if not present
+if [ ! -d "${HF_CKPT}" ]; then
+    echo "Downloading Qwen2.5-7B-Instruct..."
+    huggingface-cli download Qwen/Qwen2.5-7B-Instruct --local-dir "${HF_CKPT}"
+fi
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CKPT}"
-   --ref-load "${REF_CKPT}"
-   --save "${SLIME_DIR}/../checkpoints/awm_esa_v3/"
+   --save "${SLIME_DIR}/../checkpoints/awm_esa_qwen2.5_7B/"
    --save-interval 3
 )
 
@@ -112,7 +116,7 @@ ROLLOUT_ARGS=(
    --rollout-top-p 0.8
    --rollout-top-k 20
    --rollout-min-p 0
-   --global-batch-size 1023  # must be divisible by data_parallel_size=3 (6 GPUs, CP=2)
+   --global-batch-size 1023  # must be divisible by data_parallel_size=3 (6 GPUs, TP=1, CP=2)
    --balance-data
 )
 
@@ -143,7 +147,7 @@ GRPO_ARGS=(
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 7e-7
+   --lr 5e-7
    --lr-decay-style constant
    --weight-decay 0.01
    --adam-beta1 0.9
@@ -153,7 +157,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project awm-esa
-   --wandb-group qwen3-4B-esa
+   --wandb-group qwen2.5-7B-esa
 )
 
 SGLANG_ARGS=(
@@ -245,4 +249,4 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
    ${CUSTOM_ARGS[@]} \
-   --apply-chat-template-kwargs '{"enable_thinking": false}'
+   --apply-chat-template-kwargs '{}'
